@@ -92,7 +92,7 @@ def get_surface_loss_dense(data, groud_truth, dist, alpha=1):
     return posi_penalty.mean(), posi_gain.mean()
 
 def get_surf_focal_dense(data, groud_truth, dist, beta=1, alpha=0.97, gamma=2):
-    assert data.shape == groud_truth.shape
+    assert data.shape == groud_truth.shape, f'{data.shape}, {groud_truth.shape}'
     mask = groud_truth.bool()
     # try:
     #     assert (mask * dist).sum() < 1

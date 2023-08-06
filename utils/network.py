@@ -4798,6 +4798,171 @@ class CompDecoder(nn.Module):
         nbits = net_bits.sum().item() + aux_bits
         return nbits
 
+class ColorCompDecoder(nn.Module):
+    """A form of reconstructor"""
+    def __init__(self, args, param_model, in_channels=4, useIGDN=False, channels=(32, 32, 32, 32)):
+        super(ColorCompDecoder, self).__init__()
+        global SEED2
+        global seed_ptr
+
+        self.channels = channels
+        self.useIGDN = useIGDN
+        
+        if useIGDN:
+            self.activation = IGDN3d(channels[0])
+        else:
+            self.activation = nn.ReLU()
+
+        self.up0 = QConvTranspose3d(
+            in_channels=in_channels,
+            out_channels=channels[0],
+            kernel_size=5,
+            stride=2,
+            padding=2,
+            output_padding=1,
+            bias=True,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.up0.offset
+
+        self.conv0 = QConvTranspose3d(
+            in_channels=channels[0],
+            out_channels=channels[1],
+            kernel_size=5,
+            stride=2,
+            padding=2,
+            output_padding=1,
+            bias=True,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv0.offset
+
+        self.up1 = QConvTranspose3d(
+            in_channels=channels[1],
+            out_channels=channels[2],
+            kernel_size=5,
+            stride=2,
+            bias=True,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.up1.offset
+
+        self.conv1 = QConv3d(
+            in_channels=channels[2],
+            out_channels=channels[2],
+            kernel_size=4,
+            stride=1,
+            bias=True,
+            padding=0,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv1.offset
+
+        self.up2 = QConvTranspose3d(
+            in_channels=channels[2],
+            out_channels=channels[3],
+            kernel_size=5,
+            stride=2,
+            bias=True,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.up2.offset
+
+        self.conv2 = QConv3d(
+            in_channels=channels[3],
+            out_channels=channels[3],
+            kernel_size=4,
+            stride=1,
+            bias=True,
+            padding=0,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv2.offset
+
+        self.conv2_cls = QConv3d(
+            in_channels=channels[3],
+            out_channels=1,
+            kernel_size=3,
+            stride=1,
+            bias=True,
+            padding=1,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv2_cls.offset
+        
+        self.conv1_cls = IConv3d(
+            in_channels=channels[2],
+            out_channels=1,
+            kernel_size=3,
+            stride=1,
+            bias=True,
+            padding=1,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv1_cls.offset
+        
+        self.conv0_cls = IConv3d(
+            in_channels=channels[1],
+            out_channels=1,
+            kernel_size=3,
+            stride=1,
+            bias=True,
+            padding=1,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv0_cls.offset
+
+        self.conv2_color = QConv3d(
+            in_channels=channels[3],
+            out_channels=3,
+            kernel_size=3,
+            stride=1,
+            bias=True,
+            padding=1,
+            SEED=SEED2[seed_ptr:])
+        seed_ptr += self.conv2_color.offset
+    
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+        self.likelihood_model = GaussianLikelihoodModel(step_size=1/16)
+
+    def forward(self, x, q):
+        out = self.activation(self.up0(x, q))
+        out = self.relu(self.conv0(out, q))
+        out_cls_0 = self.sigmoid(self.conv0_cls(out))
+        out = self.relu(self.up1(out, q))
+        out = self.relu(self.conv1(out, q))
+        out_cls_1 = self.sigmoid(self.conv1_cls(out))
+        out = self.relu(self.up2(out, q))
+        out = self.relu(self.conv2(out, q))
+        out_cls = self.conv2_cls(out, q)
+        out_cls = self.sigmoid(out_cls)
+        out_color = self.conv2_color(out, q)
+
+        out_cls_list = [out_cls_0, out_cls_1, out]
+
+        # if torch.any(torch.isnan(out)):
+        #     import IPython
+        #     IPython.embed()
+        #     raise ValueError()
+
+        params = self.get_q_params()
+        net_bits = torch.stack([self.likelihood_model(bypass_round16(p)) for p in params])
+        return out_cls, out_color, out_cls_list, net_bits
+
+    def get_q_params(self):
+        params = []
+        
+        params.append(self.up0.kernel)
+        params.append(self.conv0.kernel)
+        params.append(self.up1.kernel)
+        params.append(self.conv1.kernel)
+        params.append(self.up2.kernel)
+        params.append(self.conv2.kernel)
+        params.append(self.conv2_cls.kernel)
+        params.append(self.conv2_color.kernel)
+
+        return params
+    
+    def get_bits(self):
+        params = self.get_q_params()
+        net_bits = torch.stack([self.likelihood_model(bypass_round16(p)) for p in params])
+        aux_bits = sum([self.channels[i]*2 for i in (1,2,3)]) * 32 + 32 + (self.channels[1] ** 2 + self.channels[1]) * 32
+        nbits = net_bits.sum().item() + aux_bits
+        return nbits
+
 
 class CompStraightDecoder(nn.Module):
     """A form of reconstructor"""

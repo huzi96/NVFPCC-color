@@ -1,0 +1,12 @@
+*.ckpt
+*.npy
+ckpt*/*
+get_octree
+*.ply
+*.npy
+*.txt
+module_arithmeticcoding
+*.pk
+utils/*
+__pycache__/*
+*/__pycache__/*

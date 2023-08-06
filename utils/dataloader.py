@@ -1,6 +1,7 @@
 import numpy as np
 import open3d as o3d
 import torch
+import tqdm
 
 def loadCloudFromBinary(file, cols=3):
     f = open(file, "rb")
@@ -150,7 +151,7 @@ class ContinuousVoxelDataset(torch.utils.data.Dataset):
         return self.N_leaf
 
 class LoadedVoxelDataset(torch.utils.data.Dataset):
-    def __init__(self, origin_fn, gt_fn, dist_fn, shuffle=True):
+    def __init__(self, origin_fn, gt_fn, dist_fn, color_fn=None, shuffle=True):
         super(LoadedVoxelDataset, self).__init__()
         self.origins = np.load(origin_fn)
         self.gt_grid = np.load(gt_fn)
@@ -159,6 +160,15 @@ class LoadedVoxelDataset(torch.utils.data.Dataset):
         self.N = self.gt_grid.sum()
         print(f"A total numbero of {self.N} points")
         self.shuffle = shuffle
+
+        self.use_color = False
+        if color_fn is not None:
+            data = np.load(color_fn)
+            self.color_grid = np.transpose(
+                data, (0, 5, 1, 2, 3, 4)).squeeze(2)
+            self.use_color = True
+        else:
+            self.color_grid = np.zeros_like(self.gt_grid)
 
     def __getitem__(self, idx):
         # Random sample 
@@ -169,12 +179,14 @@ class LoadedVoxelDataset(torch.utils.data.Dataset):
         tidx = torch.tensor(nidx).long()
         gt_grid_t = torch.from_numpy(self.gt_grid[idx]).float()
         dist_t = torch.from_numpy(self.dist[idx]).float()
-        return tidx, gt_grid_t, dist_t
+        color_t = torch.from_numpy(self.color_grid[idx]).float()
+        return tidx, gt_grid_t, dist_t, color_t
     
     def get_all(self):
         gt_grid_t = torch.from_numpy(self.gt_grid).float()
         dist_t = torch.from_numpy(self.dist).float()
-        return gt_grid_t, dist_t
+        color_t = torch.from_numpy(self.color_grid).float()
+        return gt_grid_t, dist_t, color_t
 
 
     def __len__(self):

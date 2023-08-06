@@ -14,10 +14,14 @@ import tqdm
 import MinkowskiEngine as ME
 
 from utils.dataloader import LoadedVoxelDataset
-from utils.network import SingleLayerLatentGen, QuantGaussianLikelihood, CompDecoder, SingleLayerLatentGen
+from utils.network import SingleLayerLatentGen, QuantGaussianLikelihood, CompDecoder, SingleLayerLatentGen, ColorCompDecoder
 from utils.loss import get_focal_dense, get_acc_dense, get_surf_dual_dense, get_surf_focal_dense, get_sse1
 import subprocess as sp
 import util_code_quantized_weights as entropy_module
+
+####################### Change log ##########################################
+# 08/04/2021: Add color information to the grid.                            #
+#############################################################################
 
 ###########################################################################
 param_model = 'Gaussian'
@@ -73,6 +77,50 @@ class Net(nn.Module):
     def get_bits(self, all_emb):
         return self.get_latent_bits(all_emb), self.get_network_bits()
 
+class ColorNet(nn.Module):
+    def __init__(self, args, param_model, ch=4, channel_str='32,32,32,32') -> None:
+        super(ColorNet, self).__init__()
+        print(f'[Net] Building model with latent channel {ch} and channel string {channel_str}')
+        channels = tuple(np.array(channel_str.split(','), dtype=int))
+        self.latent_gen = SingleLayerLatentGen(in_channels=ch, out_channels=ch)
+        self.entropy_coder = QuantGaussianLikelihood(in_channels=ch)
+        self.reconstructor = ColorCompDecoder(args, param_model, useIGDN=True, in_channels=ch, channels=channels)
+    
+    def forward(self, emb, mode, q):
+        latent = self.latent_gen(emb)
+        latent_rounded, latent_likelihood = self.entropy_coder(latent, mode)
+        out, out_color, out_cls_list, net_bits = self.reconstructor(latent_rounded, q)
+        return out, out_color, out_cls_list, net_bits, latent_likelihood
+    
+    def reconstruct(self, latent, q):
+        out, out_color, out_cls_list, net_bits = self.reconstructor(latent, q)
+        return out, out_color
+    
+    def get_network_bits(self):
+        nbits = self.entropy_coder.get_bits() + self.reconstructor.get_bits()
+        return nbits
+    
+    def get_latent_bits(self, all_emb):
+        latent = self.latent_gen(all_emb)
+        _, latent_likelihood = self.entropy_coder(latent, mode='eval')
+        return latent_likelihood.sum()
+
+    def get_latent_code(self, all_emb):
+        latent = self.latent_gen(all_emb)
+        quantized_latent, latent_likelihood = self.entropy_coder(
+            latent, mode='eval')
+        sigma = torch.abs(self.entropy_coder.sigma)
+        mu = self.entropy_coder.mu
+        return {
+            'quantized_latent': quantized_latent,
+            'sigma': sigma,
+            'mu': mu,
+            'latent_likelihood': latent_likelihood
+        }
+    
+    def get_bits(self, all_emb):
+        return self.get_latent_bits(all_emb), self.get_network_bits()
+
 class MultiscaleProcessor(nn.Module):
     def __init__(self):
         super(MultiscaleProcessor, self).__init__()
@@ -101,18 +149,25 @@ class MultiscaleCounter(nn.Module):
         return x
 
 def train():
+    MSE_WEIGHT = 1e6
     print(f'Rate loss = {args.w1} * b1 + b2 + {args.w2} * b3')
     device = torch.device('cuda')
     print('Buiding dataloader')
     fid = args.input[:-4]
-    train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy')
+    if args.color:
+        train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy', f'{fid}_l5_color_grid.npy')
+    else:
+        train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy')
     training_loader = torch.utils.data.DataLoader(
         train_data, batch_size=args.batchsize, shuffle=args.shuffle, num_workers=1, drop_last=False
     )
     print('Dataloader built')
     print('Using lambda: ', args.lmbda)
     ch=args.ch
-    net = Net(args, param_model, ch, channel_str=args.chanstr).to(device)
+    if args.color:
+        net = ColorNet(args, param_model, ch, channel_str=args.chanstr).to(device)
+    else:
+        net = Net(args, param_model, ch, channel_str=args.chanstr).to(device)
     opt = optim.Adam(net.parameters(), lr=args.lr)
     sch = optim.lr_scheduler.MultiStepLR(opt, [300, 400, 450], 0.1)
     ms_processor = MultiscaleProcessor().to(device)
@@ -140,6 +195,7 @@ def train():
         list_posi_gain = []
         list_sse = []
         list_denom = []
+        list_color_mse_loss = []
 
         if epoch == 0:
             q = 1
@@ -148,16 +204,26 @@ def train():
 
         for i, data in enumerate(training_loader, 0):
             opt.zero_grad()
-            indices, x_dense, dist = data
+            indices, x_dense, dist, color_grid = data
             x_dense = x_dense.to(device)
             dist = dist.to(device)
+            if args.color:
+                color_grid = color_grid.to(device)
             n_pts = x_dense.sum()
             indices = indices.reshape(-1)
             ground_truth_list = ms_processor(x_dense)
 
             emb_node = emb[indices]
 
-            out, out_cls_list, net_bits, latent_bits = net(emb_node, 'train', q)
+            if args.color:
+                out, out_color, out_cls_list, net_bits, latent_bits = net(
+                    emb_node, 'train', q)
+                mse_loss = torch.sum(
+                    torch.square(out_color - color_grid) * x_dense
+                    ) / x_dense.sum()
+            else:
+                out, out_cls_list, net_bits, latent_bits = net(
+                    emb_node, 'train', q)
             b_latent = latent_bits.sum() / n_pts
             b_net = net_bits.sum() / train_data.N
             bpp = b_latent + b_net
@@ -192,8 +258,10 @@ def train():
             sse, denom = get_sse1(out, x_dense, dist, 0.6)
             list_sse.append(sse.item())
             list_denom.append(denom.item())
-
+            
             loss = bce + ms_bces[0] + ms_bces[1] + args.lmbda * bpp_loss
+            if args.color:
+                loss += mse_loss * MSE_WEIGHT
             loss.backward()
             
             if torch.any(torch.isnan(loss)):
@@ -219,19 +287,30 @@ def train():
             list_bpp.append(bpp.item())
             list_b_latent.append(b_latent.item())
             list_b_net.append(b_net.item())
+            if args.color:
+                list_color_mse_loss.append(mse_loss.item())
             opt.step()
             cnt += 1
 
         ######## Update emb ####################################################
         opt_emb.zero_grad()
-        x_dense_all, dist_all = train_data.get_all()
+        x_dense_all, dist_all, color_all = train_data.get_all()
         x_dense_all = x_dense_all.to(device)
         dist_all = dist_all.to(device)
+        if args.color:
+            color_all = color_all.to(device)
         n_pts = x_dense_all.sum()
         emb_all = emb
 
         ground_truth_list = ms_processor(x_dense_all)
-        out, out_cls_list, net_bits, latent_bits = net(emb_all, 'train', q)
+        if args.color:
+            out, out_color, out_cls_list, net_bits, latent_bits = net(
+                emb_all, 'train', q)
+            mse_loss = torch.sum(
+                torch.square(out_color - color_all) * x_dense_all
+                ) / x_dense_all.sum()
+        else:
+            out, out_cls_list, net_bits, latent_bits = net(emb_all, 'train', q)
         b_latent = latent_bits.sum() / n_pts
         b_net = net_bits.sum() / train_data.N
         bpp = b_latent + b_net
@@ -246,6 +325,8 @@ def train():
         
         bce = get_surf_focal_dense(out, x_dense_all, dist_all, beta=1, alpha=focal_alpha)
         loss = bce + ms_bces[0] + ms_bces[1] + args.lmbda * bpp_loss
+        if args.color:
+            loss += mse_loss * MSE_WEIGHT
         loss.backward()
         opt_emb.step()
         ####### Done ###########################################################
@@ -279,6 +360,8 @@ def train():
             psnr1
         )
         )
+        if args.color:
+            print('Color MSE:', np.sum(list_color_mse_loss) / cnt)
         start_time = time.time()
 
         if epoch % 10 == 0:
@@ -304,16 +387,24 @@ def train():
             list_posi_gain = []
             list_sse = []
             list_denom = []
+            list_color_mse_loss = []
 
             with torch.no_grad():
-                x_dense_all, dist_all = train_data.get_all()
+                x_dense_all, dist_all, color_all = train_data.get_all()
                 x_dense_all = x_dense_all.to(device)
                 dist_all = dist_all.to(device)
+
                 n_pts = x_dense_all.sum()
                 emb_all = emb
                 ground_truth_list = ms_processor(x_dense_all)
-
-                out, out_cls_list, net_bits, latent_bits = net(emb_all, 'eval', tq)
+                if args.color:
+                    color_all = color_all.to(device)
+                    out, out_color, out_cls_list, net_bits, latent_bits = net(emb_all, 'eval', tq)
+                    mse_loss = torch.sum(
+                        torch.square(out_color - color_all) * x_dense_all
+                        ) / x_dense_all.sum()
+                else:
+                    out, out_cls_list, net_bits, latent_bits = net(emb_all, 'eval', tq)
                 b_latent = latent_bits.sum() / n_pts
                 b_net = net_bits.sum() / train_data.N
                 assert n_pts.item() == train_data.N
@@ -361,6 +452,8 @@ def train():
                 sse, denom = get_sse1(out, x_dense_all, dist_all, 0.6)
                 list_sse.append(sse.item())
                 list_denom.append(denom.item())
+                if args.color:
+                    list_color_mse_loss.append(mse_loss.item())
                 cnt += 1
 
                 timestamp = time.time()
@@ -390,6 +483,8 @@ def train():
                     psnr1
                 )
                 )
+                if args.color:
+                    print('Color MSE:', np.sum(list_color_mse_loss) / cnt)
                 start_time = time.time()
 
 def encode():
@@ -397,12 +492,20 @@ def encode():
     thh = args.thh
     device = torch.device('cuda')
     fid = args.input[:-4]
-    train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy', shuffle=False)
+    if args.color:
+        train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy', f'{fid}_l5_color_grid.npy',
+        shuffle=False)
+    else:
+        train_data = LoadedVoxelDataset(f'{fid}_l5_origins.npy', f'{fid}_l5_gt_grid.npy', f'{fid}_l5_dist.npy',
+        shuffle=False)
     training_loader = torch.utils.data.DataLoader(
         train_data, batch_size=args.batchsize, shuffle=False, num_workers=0, drop_last=True
     )
-    net = Net(args, param_model=param_model, ch=args.ch, channel_str=args.chanstr).to(device)
-    rc_pts = []
+    
+    if args.color:
+        net = ColorNet(args, param_model, args.ch, channel_str=args.chanstr).to(device)
+    else:
+        net = Net(args, param_model, args.ch, channel_str=args.chanstr).to(device)
 
     #######################################################################
     # 1. Network parameters ###############################################
@@ -498,12 +601,14 @@ def encode():
     from utils.loss import get_acc, get_se
     density_cubes = []
     latent_rounded_list = []
+    rc_pts = []
+    rc_colors = []
     with torch.no_grad():
         if False:
             pass
         else:
             for i,data in enumerate(training_loader):
-                indices, gt_grid, dist = data
+                indices, gt_grid, dist, color_grid = data
                 gt_grid = gt_grid.to(device)
                 dist = dist.to(device)
                 indices = indices.to(device).long().reshape(-1)
@@ -513,11 +618,16 @@ def encode():
                 x_dense = gt_grid
 
                 x_emb = emb[indices]
-                out_all, _, _, _ = net(x_emb, mode='eval', q=q)
+                if args.color:
+                    out_all, out_color, _, _, _ = net(x_emb, mode='eval', q=q)
+                else:
+                    out_all, _, _, _ = net(x_emb, mode='eval', q=q)
                 out_dense = out_all
                 density_cubes.append(out_dense.cpu().numpy())
 
                 out_all = to_sparse(out_dense)
+                if args.color:
+                    out_color = to_sparse(out_color)
 
                 pacc, nacc = get_acc(out_all, x, thh=thh)
                 sse, denom = get_sse1(out_dense, x_dense, dist, thh)
@@ -531,13 +641,20 @@ def encode():
 
                 mask = (out_all.F[:,0] > thh).bool()
                 out = pruning(out_all, mask)
+                if args.color:
+                    out_color = pruning(out_color, mask)
                 for j in range(args.batchsize):
                     coords1 = out.C[:,1:].cpu().numpy()
                     origin = origins[i]
                     scale = 1
                     pts = coords1 * scale + origin
                     rc_pts.append(pts)
+                    if args.color:
+                        colors = out_color.F.cpu().numpy()
+                        rc_colors.append(colors)
             rc_pts = np.concatenate(rc_pts, 0)
+            if args.color:
+                rc_colors = np.concatenate(rc_colors, 0)
 
             latent_bits = len(latent_pack['latent_byte_stream']) * 8
 
@@ -550,6 +667,9 @@ def encode():
     rcpts = np.asarray(rcpcd.points)
     rcpts = np.round(rcpts).astype(np.float64)
     rcpcd.points = o3d.utility.Vector3dVector(rcpts)
+    if args.color:
+        # rc_colors = np.clip((rc_colors + 1 / 2), 0, 1)
+        rcpcd.colors = o3d.utility.Vector3dVector(rc_colors)
     o3d.visualization.draw_geometries([rcpcd])
     o3d.io.write_point_cloud('rc_enc.ply', rcpcd, write_ascii=True)
 
@@ -743,6 +863,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--qp', type=float, default=16, help='Quantization parameter used for net weights.'
+    )
+    parser.add_argument(
+        '--color', action='store_true', help='Use color?'
     )
 
     args = parser.parse_args()

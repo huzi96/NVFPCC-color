@@ -5,7 +5,8 @@ import sys
 import time
 
 ################################################################################
-# Example usage: python util_get_grids.py longdress_vox10_1300.ply 5 ###########
+# Example usage: python util_get_grids.py longdress_vox10_1300.ply 5           #
+# Update 08/04/2023: also save the color information.                          #
 ################################################################################
 qstr = ''
 fid = sys.argv[1].split('/')[-1][:-4]
@@ -34,13 +35,21 @@ kd_tree = o3d.geometry.KDTreeFlann(pcd)
 
 start = time.time()
 res = np.zeros((len(pts),), dtype=int)
-for i,p in enumerate(pts):
+for i, p in enumerate(pts):
     res[i] = kd_tree.search_knn_vector_3d(p, 1)[1][0]
 end = time.time()
 refs = np.asarray(pcd.points)
+color_refs = np.asarray(pcd.colors)
 dist = np.sqrt(np.sum(np.square(refs[res] - pts), -1))
-dist = dist.reshape(len(origins),1,32,32,32)
+dist = dist.reshape(len(origins), 1, 32, 32, 32)
 gt_grid = (dist == 0).astype(np.uint8)
 gt_grid = gt_grid.reshape(dist.shape)
+
+import IPython
+IPython.embed()
+
+color_grid = color_refs[res].reshape(len(origins), 1, 32, 32, 32, 3)
+
 np.save(f'{fid}_l{lx}{qstr}_gt_grid', gt_grid)
 np.save(f'{fid}_l{lx}{qstr}_dist', dist)
+np.save(f'{fid}_l{lx}{qstr}_color_grid', color_grid)
